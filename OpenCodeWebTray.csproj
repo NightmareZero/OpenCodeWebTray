@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>OpenCodeWebTray</AssemblyName>
+    <RootNamespace>OpenCodeWebTray</RootNamespace>
+    <ApplicationIcon>Assets\opencode.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Company>OpenCodeWebTray</Company>
+    <Product>OpenCode Web Tray</Product>
+    <!-- 可选：发布为单文件自包含可免运行时依赖 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\opencode.ico" />
+    <EmbeddedResource Include="Assets\opencode-gray.ico" />
+  </ItemGroup>
+
+</Project>
