@@ -1,4 +1,5 @@
 using System.IO;
+using System.Reflection;
 using System.Text;
 
 namespace OpenCodeWebTray;
@@ -35,11 +36,23 @@ internal static class TrayConfig
     public static string ResolveConfigPath()
     {
         // Environment.ProcessPath 在单文件发布（self-contained/framework-dependent）下
-        // 仍返回 bundle 后的 exe 路径；取不到时回退到程序集位置。
-        string exePath = Environment.ProcessPath
-            ?? typeof(TrayConfig).Assembly.Location;
-        string dir = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
-        string name = Path.GetFileNameWithoutExtension(exePath);
+        // 仍返回 bundle 后的 exe 路径。取不到时用 BaseDirectory + 入口程序集名兜底
+        //（单文件下 Assembly.Location 为空，故不依赖它）。
+        string dir;
+        string name;
+
+        string exePath = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(exePath))
+        {
+            dir = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
+            name = Path.GetFileNameWithoutExtension(exePath);
+        }
+        else
+        {
+            dir = AppContext.BaseDirectory;
+            name = Assembly.GetEntryAssembly()?.GetName().Name;
+        }
+
         if (string.IsNullOrEmpty(name)) name = "OpenCodeWebTray";
         return Path.Combine(dir, name + ".ini");
     }
