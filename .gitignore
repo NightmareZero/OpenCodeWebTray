@@ -23,7 +23,7 @@ ehthumbs.db
 Desktop.ini
 .DS_Store
 
-# ---- Publish ----
-publish/
-[Pp]ublish/
+# ---- Publish / Release ----
+publish*/
+dist/
 *.publishsettings
