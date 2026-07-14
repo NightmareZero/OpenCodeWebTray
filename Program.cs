@@ -19,13 +19,24 @@ internal static class Program
         {
             if (!createdNew)
             {
-                // 已有实例在运行，直接退出
+                // 已有实例在运行：给个提示，避免用户以为没启动又反复点
+                MessageBox.Show(
+                    "OpenCode Web Tray 已在运行，请检查系统托盘" +
+                    "（若不可见，点击托盘区向上箭头展开隐藏图标）。",
+                    "OpenCode Web Tray",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
                 return;
             }
 
             ApplicationConfiguration.Initialize();
             Application.Run(new TrayApplicationContext());
         }
+            catch (Exception ex)
+            {
+                // 启动期异常写日志到 exe 同目录，避免静默崩溃无法定位
+                try { System.IO.File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "crash.log"), ex.ToString(), System.Text.Encoding.UTF8); } catch { }
+            }
         finally
         {
             try { _mutex?.ReleaseMutex(); } catch { }
