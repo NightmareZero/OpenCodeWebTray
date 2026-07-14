@@ -10,20 +10,18 @@ namespace OpenCodeWebTray;
 /// </summary>
 internal sealed class TrayApplicationContext : ApplicationContext
 {
-    private const string OpencodeUrl = "http://127.0.0.1:4096/";
-    private const string OpencodeArgs = "web --port 4096";
+    private readonly int _port;
+    private readonly string _opencodeUrl;
+    private readonly string _opencodeArgs;
 
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
 
+    private readonly ToolStripMenuItem _miOpenPage;
     private readonly ToolStripMenuItem _miStart;
     private readonly ToolStripMenuItem _miStop;
     private readonly ToolStripMenuItem _miExit;
-
-    private readonly System.Windows.Forms.Timer _clickTimer;
-    private readonly int _clickTimeout; // 系统双击判定时间，用于区分单击/双击
-    private int _clickCount;
 
     private Process _process;
     private DateTime _processStartTime; // opencode 进程启动时刻，用于判断是否"秒退"
@@ -36,14 +34,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _iconOn = LoadIcon("OpenCodeWebTray.Assets.opencode.ico");
         _iconOff = LoadIcon("OpenCodeWebTray.Assets.opencode-gray.ico");
 
+        // 从同名 INI 配置读取端口（不存在则按默认值生成）
+        _port = TrayConfig.LoadOrCreate();
+        _opencodeUrl = $"http://127.0.0.1:{_port}/";
+        _opencodeArgs = "web --port " + _port;
+
+        _miOpenPage = new ToolStripMenuItem("打开网页");
         _miStart = new ToolStripMenuItem("开启");
         _miStop = new ToolStripMenuItem("关闭");
         _miExit = new ToolStripMenuItem("Exit");
+        _miOpenPage.Click += (_, _) => OpenUrl(_opencodeUrl);
         _miStart.Click += (_, _) => StartOpencode();
         _miStop.Click += (_, _) => StopOpencode();
         _miExit.Click += (_, _) => ExitApp();
 
         var menu = new ContextMenuStrip();
+        menu.Items.Add(_miOpenPage);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_miStart);
         menu.Items.Add(_miStop);
         menu.Items.Add(new ToolStripSeparator());
@@ -55,13 +62,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             Visible = true,
             Text = "OpenCode Web Tray",
         };
-        _notifyIcon.MouseClick += NotifyIcon_MouseClick;
         _notifyIcon.MouseDoubleClick += NotifyIcon_MouseDoubleClick;
-
-        // 单击/双击判定：用系统双击时间，确保不超过系统阈值
-        _clickTimeout = SystemInformation.DoubleClickTime;
-        _clickTimer = new System.Windows.Forms.Timer { Interval = Math.Max(150, _clickTimeout) };
-        _clickTimer.Tick += ClickTimer_Tick;
 
         // 捕获 UI 线程同步上下文，供 opencode 退出回调跨线程回到 UI 线程
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
@@ -82,35 +83,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     // ---------- 鼠标交互 ----------
 
-    private void NotifyIcon_MouseClick(object sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left) return;
-        _clickCount++;
-        if (_clickCount == 1)
-        {
-            _clickTimer.Stop();
-            _clickTimer.Start(); // 启动延迟判定
-        }
-    }
-
     private void NotifyIcon_MouseDoubleClick(object sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        // 双击：取消单击的"打开网页"动作，改为切换开关
-        _clickTimer.Stop();
-        _clickCount = 0;
+        // 单击无动作，故双击可干净触发，无需定时器去抖
         ToggleOpencode();
-    }
-
-    private void ClickTimer_Tick(object sender, EventArgs e)
-    {
-        _clickTimer.Stop();
-        if (_clickCount >= 1)
-        {
-            _clickCount = 0;
-            // 计时器到期且期间没有发生双击 -> 视为单击：打开网页
-            OpenUrl(OpencodeUrl);
-        }
     }
 
     private void ToggleOpencode()
@@ -118,6 +95,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (_isRunning) StopOpencode();
         else StartOpencode();
     }
+
+    // ---------- 网页 ----------
 
     private static void OpenUrl(string url)
     {
@@ -150,7 +129,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             var psi = new ProcessStartInfo
             {
                 FileName = "cmd.exe",
-                Arguments = "/c opencode " + OpencodeArgs,
+                Arguments = "/c opencode " + _opencodeArgs,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
@@ -195,7 +174,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             double secs = (DateTime.Now - startedAt).TotalSeconds;
             if (secs < 5)
                 ShowBalloon("opencode 启动失败",
-                    "端口 4096 可能被占用，或 opencode 启动异常。可右键「开启」重试。",
+                    $"端口 {_port} 可能被占用，或 opencode 启动异常。可右键「开启」重试。",
                     ToolTipIcon.Warning);
             else
                 ShowBalloon("opencode 已停止",
@@ -281,8 +260,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             _isExiting = true;
-            _clickTimer?.Stop();
-            _clickTimer?.Dispose();
             try
             {
                 if (_process != null && !_process.HasExited)

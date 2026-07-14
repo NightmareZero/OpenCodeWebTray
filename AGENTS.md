@@ -1,6 +1,6 @@
 # AGENTS.md
 
-High-signal guidance for OpenCode agents working in this repo. Small Windows tray app that manages an `opencode web --port 4096` background process.
+High-signal guidance for OpenCode agents working in this repo. Small Windows tray app that manages an `opencode web --port <N>` background process (port from `OpenCodeWebTray.ini`, default 4096).
 
 ## Stack
 C# / .NET 8 + WinForms, `net8.0-windows`, `OutputType=WinExe`. Target machine needs the .NET 8 Desktop Runtime unless published self-contained. Windows-only by design.
@@ -23,8 +23,8 @@ Re-sourcing icons gotcha: `packages/web/public/*` in the opencode repo are **git
 Only the normal exit path cleans up opencode: right-click → `Exit` → `ExitApp` → `StopOpencode` → `Process.Kill(entireProcessTree: true)` on the `cmd` child.
 **Force-killing the tray orphans opencode on port 4096**; the next launch then fails fast and shows a "启动失败 / 端口可能被占用" balloon. There is **no** orphan detection by design (it would require matching opencode — see the safety rule). Tell users to always exit via the menu.
 
-## Click vs double-click
-Left-click opens `http://127.0.0.1:4096/` only after a `SystemInformation.DoubleClickTime` delay; a second click within that window cancels the open and toggles opencode on/off instead. The `_clickTimer` is intentional — don't remove it.
+## Left-click does nothing (double-click toggles)
+Single left-click on the tray icon is a no-op (the old single-click-opens-page action was too easy to mis-fire, and `opencode web` already auto-opens the page on startup). **Double-click** toggles opencode on/off via `ToggleOpencode()`. Because single-click is a no-op, there is no `_clickTimer` / click-disambiguation anymore — don't reintroduce it. Other interaction is via the right-click menu: `打开网页` / `开启` / `关闭` / `Exit`.
 
 ## Commands
 - Run (dev): `dotnet run -c Release`
@@ -51,5 +51,5 @@ Launching the exe starts a real `opencode web --port 4096`. Before testing, chec
 
 ## Notes
 - Single-instance enforced via a global `Mutex`.
-- Port/args are constants in `TrayApplicationContext` (`OpencodeUrl`, `OpencodeArgs`); changing the port means updating both.
+- Port is read from a same-name INI next to the exe (`OpenCodeWebTray.ini`, section `[opencode]`, key `port`, default 4096) by `TrayConfig.LoadOrCreate()`. It drives both the launch args (`_opencodeArgs`) and the open-page URL (`_opencodeUrl`). If the file is missing on startup a default one is generated; if the value is missing/invalid it falls back to 4096 without overwriting the user's file. There are no longer `OpencodeUrl`/`OpencodeArgs` constants.
 - Embedded icon resources load by manifest name `<RootNamespace>.<dotted path>` (e.g. `OpenCodeWebTray.Assets.opencode.ico`); `<ApplicationIcon>` additionally stamps the exe icon.
