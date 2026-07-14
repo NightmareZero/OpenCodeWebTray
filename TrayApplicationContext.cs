@@ -26,8 +26,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private int _clickCount;
 
     private Process _process;
+    private DateTime _processStartTime; // opencode 进程启动时刻，用于判断是否"秒退"
     private volatile bool _isRunning;   // opencode 后台进程是否运行中
     private bool _isExiting;            // 本程序是否正在退出
+    private readonly SynchronizationContext _uiContext; // UI 线程同步上下文（跨线程回调用）
 
     public TrayApplicationContext()
     {
@@ -60,6 +62,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _clickTimeout = SystemInformation.DoubleClickTime;
         _clickTimer = new System.Windows.Forms.Timer { Interval = Math.Max(150, _clickTimeout) };
         _clickTimer.Tick += ClickTimer_Tick;
+
+        // 捕获 UI 线程同步上下文，供 opencode 退出回调跨线程回到 UI 线程
+        _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
         // 启动时后台启动 opencode web
         StartOpencode();
@@ -139,11 +144,14 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         try
         {
+            // opencode 经 npm 安装时，PATH 入口是 .cmd/.ps1 脚本，
+            // UseShellExecute=false 无法直接执行这些 shim；
+            // 改用 cmd /c 让 Windows 经 PATHEXT 解析（CreateNoWindow 同时隐藏窗口）。
             var psi = new ProcessStartInfo
             {
-                FileName = "opencode",
-                Arguments = OpencodeArgs,
-                UseShellExecute = false,   // 不通过 shell，可隐藏窗口
+                FileName = "cmd.exe",
+                Arguments = "/c opencode " + OpencodeArgs,
+                UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
             };
@@ -151,6 +159,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _process = new Process { StartInfo = psi, EnableRaisingEvents = true };
             _process.Exited += OnProcessExited;
             _process.Start();
+            _processStartTime = DateTime.Now;
             _isRunning = true;
         }
         catch (Exception ex)
@@ -170,22 +179,34 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void OnProcessExited(object sender, EventArgs e)
     {
-        // Process.Exited 在线程池线程触发，需切回 UI 线程更新界面
+        // Process.Exited 在线程池线程触发，需切回 UI 线程更新界面并提示
+        DateTime startedAt = _processStartTime;
         try { _process?.Dispose(); } catch { }
         _process = null;
         _isRunning = false;
 
         if (_isExiting) return;
 
-        var scm = SynchronizationContext.Current;
-        if (scm != null)
+        // 回到 UI 线程：更新状态 + 异常退出提示
+        void OnUi()
         {
-            scm.Post(_ => UpdateState(), null);
+            UpdateState();
+            // 启动后短时间内退出，大概率是端口冲突 / 启动失败
+            double secs = (DateTime.Now - startedAt).TotalSeconds;
+            if (secs < 5)
+                ShowBalloon("opencode 启动失败",
+                    "端口 4096 可能被占用，或 opencode 启动异常。可右键「开启」重试。",
+                    ToolTipIcon.Warning);
+            else
+                ShowBalloon("opencode 已停止",
+                    "后台进程已退出。可右键「开启」重新启动。",
+                    ToolTipIcon.Info);
         }
+
+        if (_uiContext != null)
+            _uiContext.Post(_ => OnUi(), null);
         else
-        {
-            try { _notifyIcon.ContextMenuStrip?.BeginInvoke((Action)UpdateState); } catch { }
-        }
+            try { _notifyIcon.ContextMenuStrip?.BeginInvoke((Action)OnUi); } catch { }
     }
 
     private void StopOpencode()
@@ -235,6 +256,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _notifyIcon.Text = _isRunning ? "OpenCode Web (运行中)" : "OpenCode Web (已停止)";
         _miStart.Enabled = !_isRunning;
         _miStop.Enabled = _isRunning;
+    }
+
+    private void ShowBalloon(string title, string text, ToolTipIcon icon, int timeout = 4000)
+    {
+        if (_notifyIcon == null) return;
+        _notifyIcon.BalloonTipTitle = title;
+        _notifyIcon.BalloonTipText = text;
+        _notifyIcon.BalloonTipIcon = icon;
+        _notifyIcon.ShowBalloonTip(timeout);
     }
 
     private void ExitApp()
