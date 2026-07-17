@@ -1,18 +1,19 @@
 # AGENTS.md
 
-High-signal guidance for OpenCode agents working in this repo. Small Windows tray app that manages an `opencode web --port <N>` background process (port from `OpenCodeWebTray.ini`, default 4096).
+High-signal guidance for OpenCode agents working in this repo. Small Windows tray app that manages multiple `opencode web` instances, each corresponding to a `[profile.名称]` section in `OpenCodeWebTray.ini`. On startup, only the profile specified by `[tray].default` is automatically launched.
 
 ## Stack
 C# / .NET 8 + WinForms, `net8.0-windows`, `OutputType=WinExe`. Target machine needs the .NET 8 Desktop Runtime unless published self-contained. Windows-only by design.
 
 ## CRITICAL: never kill `opencode` by name
 The OpenCode agent itself runs **inside** an `opencode.exe -c` process. Any broad kill — `Get-Process opencode | Stop-Process`, `taskkill /im opencode.exe` — terminates your own session.
-If a tray test leaves an orphan opencode, identify the exact PID via `Win32_Process.CommandLine` (must contain `web --port 4096`) and its parent chain, then kill **only that PID**. Never match by process name.
+If a tray test leaves an orphan opencode, identify the exact PID via `Win32_Process.CommandLine` (must contain `web --port <N>` for the orphaned port) and its parent chain, then kill **only that PID**. Never match by process name.
 
 ## Don't "simplify" the opencode launch
-`StartOpencode` (in `TrayApplicationContext.cs`) launches opencode as `cmd.exe /c opencode web --port 4096` with `UseShellExecute=false` + `CreateNoWindow=true`. This is deliberate and load-bearing:
+`Start()` (in `OpencodeInstance.cs`) launches opencode as `cmd.exe /c opencode web --port <N>` with `UseShellExecute=false` + `CreateNoWindow=true`. This is deliberate and load-bearing:
 - npm-installed opencode only exposes `.cmd`/`.ps1` shims in PATH. `FileName="opencode"` + `UseShellExecute=false` **cannot** resolve shims — reverting to that breaks startup silently.
 - `opencode web` is foreground-blocking (`await new Promise(()=>{})`); the tray tracks the `cmd` child via `Process.Exited` and kills the whole tree on exit.
+- WSL mode adds `--hostname 0.0.0.0` (load-bearing: WSL2 port forwarding requires binding 0.0.0.0).
 
 ## Icons are black + gray, NOT colored
 opencode's logo is monochrome — every brand/favicon/PWA asset is 0% saturated (verified by pixel sampling). The "colored vs gray" requirement means **black = running, gray = stopped**. The gray icon is generated from the black source with ImageMagick: `magick src.png -fill "#8C8C8C" -colorize 100 ...`.
@@ -20,11 +21,11 @@ opencode's logo is monochrome — every brand/favicon/PWA asset is 0% saturated 
 Re-sourcing icons gotcha: `packages/web/public/*` in the opencode repo are **git symlinks** (raw download returns ~50 B of path text, not an image). The real files are in `packages/ui/src/assets/favicon/` (repo `sst/opencode`). Source used here: `web-app-manifest-512x512.png`, exported to multi-size `.ico` via `magick -define icon:auto-resize=256,128,64,48,40,32,24,20,16`.
 
 ## Process-cleanup contract (operational)
-Only the normal exit path cleans up opencode: right-click → `Exit` → `ExitApp` → `StopOpencode` → `Process.Kill(entireProcessTree: true)` on the `cmd` child.
-**Force-killing the tray orphans opencode on port 4096**; the next launch then fails fast and shows a "启动失败 / 端口可能被占用" balloon. There is **no** orphan detection by design (it would require matching opencode — see the safety rule). Tell users to always exit via the menu.
+Only the normal exit path cleans up opencode: right-click → `Exit` → `ExitApp` → iterates all running `OpencodeInstance`s and calls `Stop()` on each (WSL mode: internal `pkill` + fallback).
+**Force-killing the tray orphans all started opencode instances** (one per port); the next launch then fails fast and shows a "启动失败 / 端口可能被占用" balloon per port. There is **no** orphan detection by design (it would require matching opencode — see the safety rule). Tell users to always exit via the menu.
 
 ## Left-click does nothing (double-click toggles)
-Single left-click on the tray icon is a no-op (the old single-click-opens-page action was too easy to mis-fire, and `opencode web` already auto-opens the page on startup). **Double-click** toggles opencode on/off via `ToggleOpencode()`. Because single-click is a no-op, there is no `_clickTimer` / click-disambiguation anymore — don't reintroduce it. Other interaction is via the right-click menu: `打开网页` / `开启` / `关闭` / `Exit`.
+Single left-click on the tray icon is a no-op (the old single-click-opens-page action was too easy to mis-fire, and `opencode web` already auto-opens the page on startup). **Double-click** toggles the **default profile** (specified by `[tray].default`) on/off. If `[tray].default` is not set, double-click shows a balloon提示. Because single-click is a no-op, there is no `_clickTimer` / click-disambiguation anymore — don't reintroduce it. Other interaction is via the right-click menu: 每个 profile 一块（灰显标题显示名称+状态 + 打开网页 + 开启/关闭单按钮按状态切换），块间分隔符，末尾 Exit.
 
 ## Commands
 - Run (dev): `dotnet run -c Release`
@@ -47,9 +48,9 @@ Zip each output folder, named with the version:
 Attach both zips to a GitHub Release tagged `v<version>` (e.g. `v1.0.0`).
 
 ## Smoke-testing the tray
-Launching the exe starts a real `opencode web --port 4096`. Before testing, check `Get-NetTCPConnection -LocalPort 4096 -State Listen`; if something is listening, clean up only by exact PID (see safety rule). If 4096 is taken, opencode exits within ~5 s and the tray shows a port-conflict balloon — that path is expected, not a crash.
+Launching the exe automatically starts the default profile's `opencode web` (as specified by `[tray].default`). Before testing, check `Get-NetTCPConnection -LocalPort <端口> -State Listen` for each profile's port; if something is listening on a relevant port, clean up only by exact PID (see safety rule). For multi-profile testing, verify each profile's port independently. Orphan cleanup: identify the exact PID via `Win32_Process.CommandLine` (must contain `web --port <N>`) and parent chain — never match by process name.
 
 ## Notes
 - Single-instance enforced via a global `Mutex`.
-- Port is read from a same-name INI next to the exe (`OpenCodeWebTray.ini`, section `[opencode]`, key `port`, default 4096) by `TrayConfig.LoadOrCreate()`. It drives both the launch args (`_opencodeArgs`) and the open-page URL (`_opencodeUrl`). If the file is missing on startup a default one is generated; if the value is missing/invalid it falls back to 4096 without overwriting the user's file. There are no longer `OpencodeUrl`/`OpencodeArgs` constants.
+- Configuration uses multi-profile INI format. `TrayConfig.LoadOrCreate()` loads `OpenCodeWebTray.ini` and returns a `LoadedConfig` with the `[tray].default` value and a list of `Profile` records. Each `OpencodeInstance` derives its `_opencodeUrl` and `_opencodeArgs` from its own `Profile.Port` (instance fields, not global constants). `[tray].default` decides which profile auto-starts at launch; empty means no auto-start. Old `[opencode]`/`[WSL]` format auto-migrates to `[profile.windows]` with a `.bak` backup. File missing → template generated; value missing/invalid → falls back to 4096 without overwriting.
 - Embedded icon resources load by manifest name `<RootNamespace>.<dotted path>` (e.g. `OpenCodeWebTray.Assets.opencode.ico`); `<ApplicationIcon>` additionally stamps the exe icon.

@@ -1,66 +1,63 @@
-using System.Diagnostics;
 using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows.Forms;
 
 namespace OpenCodeWebTray;
 
 /// <summary>
-/// 托盘应用主上下文：管理 opencode web 后台进程、托盘图标与交互。
+/// 托盘应用主上下文：多实例协调器。
+/// 管理多个 OpencodeInstance，每个对应一个 [profile.*] 配置。
 /// </summary>
 internal sealed class TrayApplicationContext : ApplicationContext
 {
-    private readonly int _port;
-    private readonly string _distro;      // 目标 WSL 发行版；空 = Windows 原生模式
-    private readonly string _wslUser;     // 在 WSL 发行版中以哪个用户身份运行 opencode
-    private readonly string _opencodeUrl;
-    private readonly string _opencodeArgs;
-
+    private readonly List<OpencodeInstance> _instances;
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
+    private readonly SynchronizationContext _uiContext;
+    private readonly OpencodeInstance _defaultInstance;
+    private bool _isExiting;
 
-    private readonly ToolStripMenuItem _miOpenPage;
-    private readonly ToolStripMenuItem _miStart;
-    private readonly ToolStripMenuItem _miStop;
-    private readonly ToolStripMenuItem _miExit;
+    /// <summary>
+    /// 每个实例对应的菜单项引用，用于就地刷新 Text/Enabled，不重建菜单。
+    /// </summary>
+    private sealed record InstanceMenuItems(
+        ToolStripMenuItem Title,
+        ToolStripMenuItem OpenPage,
+        ToolStripMenuItem Toggle
+    );
 
-    private Process _process;
-    private DateTime _processStartTime; // opencode 进程启动时刻，用于判断是否"秒退"
-    private volatile bool _isRunning;   // opencode 后台进程是否运行中
-    private bool _isExiting;            // 本程序是否正在退出
-    private readonly SynchronizationContext _uiContext; // UI 线程同步上下文（跨线程回调用）
+    private readonly Dictionary<OpencodeInstance, InstanceMenuItems> _menuMap = new();
 
     public TrayApplicationContext()
     {
         _iconOn = LoadIcon("OpenCodeWebTray.Assets.opencode.ico");
         _iconOff = LoadIcon("OpenCodeWebTray.Assets.opencode-gray.ico");
 
-        // 从同名 INI 配置读取端口与可选的 WSL 发行版（不存在则按默认值生成）
-        var cfg = TrayConfig.LoadOrCreate();
-        _port = cfg.Port;
-        _distro = cfg.Distro; // 已 Trim，空串 = Windows 原生模式
-        _wslUser = cfg.WslUser;
-        _opencodeUrl = $"http://127.0.0.1:{_port}/";
-        _opencodeArgs = "web --port " + _port;
+        _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
-        _miOpenPage = new ToolStripMenuItem("打开网页");
-        _miStart = new ToolStripMenuItem("开启");
-        _miStop = new ToolStripMenuItem("关闭");
-        _miExit = new ToolStripMenuItem("Exit");
-        _miOpenPage.Click += (_, _) => OpenUrl(_opencodeUrl);
-        _miStart.Click += (_, _) => StartOpencode();
-        _miStop.Click += (_, _) => StopOpencode();
-        _miExit.Click += (_, _) => ExitApp();
+        // 加载多 profile 配置
+        var loaded = TrayConfig.LoadOrCreate();
 
-        var menu = new ContextMenuStrip();
-        menu.Items.Add(_miOpenPage);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(_miStart);
-        menu.Items.Add(_miStop);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(_miExit);
+        // 为每个 profile 创建 OpencodeInstance
+        _instances = new List<OpencodeInstance>(loaded.Profiles.Count);
+        foreach (var profile in loaded.Profiles)
+        {
+            var inst = new OpencodeInstance(profile, _uiContext, (t, m, i) => ShowBalloon(t, m, i));
+            inst.StateChanged += OnInstanceStateChanged;
+            _instances.Add(inst);
+        }
+
+        // 解析默认实例：匹配 loaded.DefaultProfile（如 "profile.windows" 或 ""）
+        // 大小写不敏感，匹配 "profile.{Name}" 或 "Name"
+        if (!string.IsNullOrEmpty(loaded.DefaultProfile))
+        {
+            _defaultInstance = _instances.FirstOrDefault(inst =>
+                string.Equals("profile." + inst.Profile.Name, loaded.DefaultProfile, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(inst.Profile.Name, loaded.DefaultProfile, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // 构建菜单
+        var menu = BuildMenu();
 
         _notifyIcon = new NotifyIcon
         {
@@ -70,11 +67,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         };
         _notifyIcon.MouseDoubleClick += NotifyIcon_MouseDoubleClick;
 
-        // 捕获 UI 线程同步上下文，供 opencode 退出回调跨线程回到 UI 线程
-        _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        // 启动时只起默认实例；若无默认或不满足启动条件则仅显示托盘
+        if (_defaultInstance != null && _defaultInstance.CanStart)
+            _defaultInstance.Start();
 
-        // 启动时后台启动 opencode web
-        StartOpencode();
         UpdateState();
     }
 
@@ -87,352 +83,125 @@ internal sealed class TrayApplicationContext : ApplicationContext
         return new Icon(stream);
     }
 
+    // ---------- 菜单构建（一次性） ----------
+
+    /// <summary>
+    /// 构建右键菜单。每个 profile 一块，包含标题行（灰显）+ 打开网页 + 开启/关闭（单按钮，按状态切换），
+    /// 块间以分隔符隔开；最后是 Exit。
+    /// 菜单项引用存入 _menuMap，供 OnInstanceStateChanged 就地刷新。
+    /// </summary>
+    private ContextMenuStrip BuildMenu()
+    {
+        var menu = new ContextMenuStrip();
+        _menuMap.Clear();
+
+        foreach (var inst in _instances)
+        {
+            // 标题行：灰显，显示名称 + 状态标签
+            var title = new ToolStripMenuItem($"{inst.Profile.Name}  {inst.StateLabel}")
+            {
+                Enabled = false
+            };
+
+            var openPage = new ToolStripMenuItem("打开网页") { Enabled = inst.IsRunning };
+            openPage.Click += (_, _) => inst.OpenPage();
+
+            // 开启/关闭合并为单个按钮：按当前状态显示文案并切换动作
+            //  - 运行中 → "关闭"，点击 Stop
+            //  - 已停止且可启动 → "开启"，点击 Start
+            //  - 端口冲突/配置无效 → "开启" 但禁用（标题已显示原因）
+            var toggle = new ToolStripMenuItem(inst.IsRunning ? "关闭" : "开启")
+            {
+                Enabled = inst.CanStart
+            };
+            toggle.Click += (_, _) =>
+            {
+                if (inst.IsRunning) inst.Stop();
+                else inst.Start();
+            };
+
+            menu.Items.Add(title);
+            menu.Items.Add(openPage);
+            menu.Items.Add(toggle);
+            menu.Items.Add(new ToolStripSeparator());
+
+            _menuMap[inst] = new InstanceMenuItems(title, openPage, toggle);
+        }
+
+        // Exit（始终在最末）
+        var exit = new ToolStripMenuItem("Exit");
+        exit.Click += (_, _) => ExitApp();
+        menu.Items.Add(exit);
+
+        return menu;
+    }
+
     // ---------- 鼠标交互 ----------
 
     private void NotifyIcon_MouseDoubleClick(object sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
         // 单击无动作，故双击可干净触发，无需定时器去抖
-        ToggleOpencode();
-    }
 
-    private void ToggleOpencode()
-    {
-        if (_isRunning) StopOpencode();
-        else StartOpencode();
-    }
-
-    // ---------- 网页 ----------
-
-    private static void OpenUrl(string url)
-    {
-        try
+        if (_defaultInstance != null)
         {
-            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-        }
-        catch
-        {
-            // 忽略打开失败
-        }
-    }
-
-    // ---------- WSL 校验 ----------
-
-    private enum WslStatus { Ok, NotAvailable, DistroNotFound, NotWsl2 }
-
-    /// <summary>
-    /// 校验 WSL 是否可用、目标发行版是否存在且为 WSL2。
-    /// 通过 `wsl.exe -l -v` 一次性获取发行版列表；失败时在 <paramref name="message"/> 中
-    /// 返回面向用户的中文错误说明。
-    /// </summary>
-    private static WslStatus CheckWslDistro(string distro, out string message)
-    {
-        message = null;
-        string output;
-        int exitCode;
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "wsl.exe",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                StandardOutputEncoding = Encoding.UTF8,
-            };
-            psi.ArgumentList.Add("-l");
-            psi.ArgumentList.Add("-v");
-            // wsl.exe 默认输出 UTF-16LE，会出现 NUL 字节干扰解析；
-            // 设 WSL_UTF8=1 让其输出 UTF-8（仅作用于本子进程）
-            psi.EnvironmentVariables["WSL_UTF8"] = "1";
-            using var p = Process.Start(psi);
-            output = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(8000);
-            exitCode = p.ExitCode;
-        }
-        catch (Exception ex)
-        {
-            // wsl.exe 不在 PATH（WSL 未安装）或无法启动
-            message = "无法启动 wsl.exe，WSL 可能未安装或未启用：\n\n" + ex.Message +
-                      "\n\n可在管理员 PowerShell 中执行 `wsl --install`，或通过" +
-                      "「设置 → 应用 → 可选功能 → 更多 Windows 功能」安装" +
-                      "「适用于 Linux 的 Windows 子系统」。";
-            return WslStatus.NotAvailable;
-        }
-
-        if (exitCode != 0 || string.IsNullOrWhiteSpace(output))
-        {
-            message = "WSL 已安装但当前不可用（wsl.exe 返回码 " + exitCode + "）。\n\n" +
-                      "请在终端运行 `wsl -l -v` 确认状态，或执行 `wsl --install` 完成初始化。";
-            return WslStatus.NotAvailable;
-        }
-
-        // 解析输出。行格式：「* NAME STATE VERSION」，发行版名理论上可含空格，
-        // 故取「末列=VERSION、倒数第二=STATE、其余合并=NAME」。
-        // 表头行的 VERSION 列不是 1/2，会被下面的 version 检查自然过滤。
-        bool found = false;
-        bool isV2 = false;
-        foreach (string raw in output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
-        {
-            string line = raw.Trim();
-            if (line.Length == 0) continue;
-
-            var parts = line.TrimStart('*').Trim()
-                .Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) continue;
-
-            string version = parts[parts.Length - 1];
-            if (version != "1" && version != "2") continue; // 非数据行（表头 / 杂散）
-
-            string name = string.Join(" ", parts, 0, parts.Length - 2);
-            if (name.Equals(distro, StringComparison.OrdinalIgnoreCase))
-            {
-                found = true;
-                isV2 = version == "2";
-                break;
-            }
-        }
-
-        if (!found)
-        {
-            message = $"WSL 发行版「{distro}」不存在。\n\n" +
-                      "请在终端运行 `wsl -l -v` 查看已安装的发行版名称" +
-                      "（注意大小写与连字符，如 Ubuntu-22.04）。";
-            return WslStatus.DistroNotFound;
-        }
-        if (!isV2)
-        {
-            message = $"WSL 发行版「{distro}」不是 WSL2。\n\n" +
-                      "本工具依赖 WSL2 的 localhost 端口转发，WSL1 不支持。\n" +
-                      $"可执行 `wsl --set-version {distro} 2` 转换（需几分钟）。";
-            return WslStatus.NotWsl2;
-        }
-        return WslStatus.Ok;
-    }
-
-    // ---------- 进程管理 ----------
-
-    private void StartOpencode()
-    {
-        if (_isExiting) return;
-        if (_isRunning || _process != null)
-        {
-            UpdateState();
-            return;
-        }
-
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-            };
-
-            if (!string.IsNullOrEmpty(_distro))
-            {
-                // ===== WSL 模式 =====
-                // 先校验 WSL / 发行版 / 版本，任一失败则弹错误并放弃启动。
-                var status = CheckWslDistro(_distro, out string err);
-                if (status != WslStatus.Ok)
-                {
-                    _process = null;
-                    _isRunning = false;
-                    MessageBox.Show(err, "OpenCode Web Tray",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    UpdateState();
-                    return;
-                }
-
-                // Linux 下 opencode 是真实可执行文件 / 带 shebang 的脚本（无 .cmd shim 问题），
-                // 用 bash -lc 启动可加载 profile 中的 PATH（如 nvm/npm 全局安装目录）。
-                // --hostname 0.0.0.0 是 load-bearing：WSL2 的 localhost 端口转发只对
-                // 绑定 0.0.0.0 的 listener 生效；opencode 默认绑 127.0.0.1，那样 Windows
-                // 浏览器访问 http://localhost:<port> 会连不上。
-                psi.FileName = "wsl.exe";
-                psi.ArgumentList.Add("-d");
-                psi.ArgumentList.Add(_distro);
-                psi.ArgumentList.Add("-u");
-                psi.ArgumentList.Add(_wslUser);
-                psi.ArgumentList.Add("--");
-                psi.ArgumentList.Add("bash");
-                psi.ArgumentList.Add("-lc");
-                psi.ArgumentList.Add("opencode " + _opencodeArgs + " --hostname 0.0.0.0");
-                psi.EnvironmentVariables["WSL_UTF8"] = "1";
-            }
+            if (_defaultInstance.IsRunning)
+                _defaultInstance.Stop();
             else
-            {
-                // ===== Windows 原生模式 =====
-                // opencode 经 npm 安装时，PATH 入口是 .cmd/.ps1 脚本，
-                // UseShellExecute=false 无法直接执行这些 shim；
-                // 改用 cmd /c 让 Windows 经 PATHEXT 解析（CreateNoWindow 同时隐藏窗口）。
-                // 此设计是 load-bearing 的，见 AGENTS.md，勿简化。
-                psi.FileName = "cmd.exe";
-                psi.Arguments = "/c opencode " + _opencodeArgs;
-            }
-
-            _process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            _process.Exited += OnProcessExited;
-            _process.Start();
-            _processStartTime = DateTime.Now;
-            _isRunning = true;
+                _defaultInstance.Start();
         }
-        catch (Exception ex)
-        {
-            _process = null;
-            _isRunning = false;
-            string hint = string.IsNullOrEmpty(_distro)
-                ? "请确认 opencode 已安装并在 Windows PATH 中（在终端执行 `opencode --version` 验证）。"
-                : $"请确认 WSL 发行版「{_distro}」中已安装 opencode 并在其 PATH 中" +
-                  "（在该发行版终端执行 `opencode --version` 验证）。";
-            MessageBox.Show(
-                "无法启动 opencode：\n\n" + ex.Message + "\n\n" + hint,
-                "OpenCode Web Tray",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-        }
-
-        UpdateState();
-    }
-
-    private void OnProcessExited(object sender, EventArgs e)
-    {
-        // Process.Exited 在线程池线程触发，需切回 UI 线程更新界面并提示
-        DateTime startedAt = _processStartTime;
-        try { _process?.Dispose(); } catch { }
-        _process = null;
-        _isRunning = false;
-
-        if (_isExiting) return;
-
-        // 回到 UI 线程：更新状态 + 异常退出提示
-        void OnUi()
-        {
-            UpdateState();
-            // 启动后短时间内退出，大概率是端口冲突 / 启动失败
-            double secs = (DateTime.Now - startedAt).TotalSeconds;
-            if (secs < 5)
-                ShowBalloon("opencode 启动失败",
-                    $"端口 {_port} 可能被占用，或 opencode 启动异常。可右键「开启」重试。",
-                    ToolTipIcon.Warning);
-            else
-                ShowBalloon("opencode 已停止",
-                    "后台进程已退出。可右键「开启」重新启动。",
-                    ToolTipIcon.Info);
-        }
-
-        if (_uiContext != null)
-            _uiContext.Post(_ => OnUi(), null);
         else
-            try { _notifyIcon.ContextMenuStrip?.BeginInvoke((Action)OnUi); } catch { }
+        {
+            ShowBalloon(
+                "未设置默认 profile",
+                "在配置文件 [tray].default 设置一个 profile 标识以启用双击切换。",
+                ToolTipIcon.Info);
+        }
     }
 
-    /// <summary>
-    /// 在目标 WSL 发行版内终止 opencode（按命令行精确匹配端口，避免误杀其他实例）。
-    /// 这是 WSL 模式下干净停止的唯一可靠方式：直接 Kill wsl.exe 会让内部进程被
-    /// wslhost.exe 接管成为孤儿，继续占用端口。
-    /// </summary>
-    private void KillOpencodeInsideWsl()
+    // ---------- 状态刷新（就地更新，不重建菜单） ----------
+
+    private void OnInstanceStateChanged(object sender, EventArgs e)
     {
-        if (string.IsNullOrEmpty(_distro)) return;
-        var psi = new ProcessStartInfo
-        {
-            FileName = "wsl.exe",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        psi.ArgumentList.Add("-d");
-        psi.ArgumentList.Add(_distro);
-        psi.ArgumentList.Add("-u");
-        psi.ArgumentList.Add(_wslUser);
-        psi.ArgumentList.Add("--");
-        psi.ArgumentList.Add("bash");
-        psi.ArgumentList.Add("-c");
-        // 精确匹配端口的 opencode 实例；|| true 保证无匹配时也返回 0
-        psi.ArgumentList.Add($"pkill -f 'opencode web --port {_port}' || true");
-        psi.EnvironmentVariables["WSL_UTF8"] = "1";
-        using var p = Process.Start(psi);
-        p.WaitForExit(5000);
-    }
+        if (_isExiting) return;
 
-    private void StopOpencode()
-    {
-        if (_process == null || !_isRunning)
+        if (sender is OpencodeInstance inst && _menuMap.TryGetValue(inst, out var items))
         {
-            UpdateState();
-            return;
+            items.Title.Text = $"{inst.Profile.Name}  {inst.StateLabel}";
+            items.OpenPage.Enabled = inst.IsRunning;
+            items.Toggle.Text = inst.IsRunning ? "关闭" : "开启";
+            items.Toggle.Enabled = inst.CanStart;
         }
-
-        try
-        {
-            _process.Exited -= OnProcessExited;
-            if (!_process.HasExited)
-            {
-                if (!string.IsNullOrEmpty(_distro))
-                {
-                    // WSL 模式两阶段杀：
-                    // ① 从 WSL 内部 pkill opencode；
-                    // ② 等 wsl.exe 自然退出（opencode 死 → bash 退出 → wsl.exe 退出）；
-                    // ③ 仍不死才 fallback 强杀（此时内部已空，无害）。
-                    try { KillOpencodeInsideWsl(); } catch { }
-                    try { _process.WaitForExit(8000); } catch { }
-                }
-
-                if (!_process.HasExited)
-                {
-                    try
-                    {
-                        _process.Kill(entireProcessTree: true); // 连同子进程一并终止
-                        _process.WaitForExit(3000);
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        // 进程刚好已退出，忽略
-                    }
-                }
-            }
-        }
-        catch
-        {
-            // 忽略终止过程中的异常
-        }
-        finally
-        {
-            try { _process?.Dispose(); } catch { }
-            _process = null;
-            _isRunning = false;
-        }
-
         UpdateState();
     }
-
-    // ---------- 状态同步 ----------
 
     private void UpdateState()
     {
         if (_notifyIcon == null) return;
-        _notifyIcon.Icon = _isRunning ? _iconOn : _iconOff;
-        _notifyIcon.Text = _isRunning ? "OpenCode Web (运行中)" : "OpenCode Web (已停止)";
-        _miStart.Enabled = !_isRunning;
-        _miStop.Enabled = _isRunning;
+
+        int runningCount = _instances.Count(i => i.IsRunning);
+        _notifyIcon.Icon = runningCount > 0 ? _iconOn : _iconOff;
+
+        if (_instances.Count == 0)
+            _notifyIcon.Text = "OpenCode Web Tray (无配置)";
+        else if (runningCount > 0)
+            _notifyIcon.Text = $"OpenCode Web Tray ({runningCount} 个运行中)";
+        else
+            _notifyIcon.Text = "OpenCode Web Tray (已停止)";
     }
 
-    private void ShowBalloon(string title, string text, ToolTipIcon icon, int timeout = 4000)
-    {
-        if (_notifyIcon == null) return;
-        _notifyIcon.BalloonTipTitle = title;
-        _notifyIcon.BalloonTipText = text;
-        _notifyIcon.BalloonTipIcon = icon;
-        _notifyIcon.ShowBalloonTip(timeout);
-    }
+    // ---------- 退出 ----------
 
     private void ExitApp()
     {
         _isExiting = true;
-        StopOpencode();
-        _notifyIcon.Visible = false; // 先隐藏，避免托盘残留幽灵图标
+        foreach (var inst in _instances)
+            inst.Stop();
+
+        _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
+        _iconOn.Dispose();
+        _iconOff.Dispose();
         Application.Exit();
     }
 
@@ -441,26 +210,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             _isExiting = true;
-            try
-            {
-                if (_process != null && !_process.HasExited)
-                {
-                    // WSL 模式：同样先内部 pkill 再 fallback 强杀，避免遗留孤儿进程占端口。
-                    if (!string.IsNullOrEmpty(_distro))
-                    {
-                        try { KillOpencodeInsideWsl(); } catch { }
-                        try { _process.WaitForExit(5000); } catch { }
-                    }
-                    if (!_process.HasExited)
-                        _process.Kill(entireProcessTree: true);
-                }
-            }
-            catch { }
-            try { _process?.Dispose(); } catch { }
+            foreach (var inst in _instances)
+                inst.Dispose();
             _notifyIcon?.Dispose();
             _iconOn?.Dispose();
             _iconOff?.Dispose();
         }
         base.Dispose(disposing);
+    }
+
+    // ---------- 气球提示（作为回调注入 OpencodeInstance） ----------
+
+    private void ShowBalloon(string title, string text, ToolTipIcon icon, int timeout = 4000)
+    {
+        if (_notifyIcon == null) return;
+        _notifyIcon.BalloonTipTitle = title;
+        _notifyIcon.BalloonTipText = text;
+        _notifyIcon.BalloonTipIcon = icon;
+        _notifyIcon.ShowBalloonTip(timeout);
     }
 }
